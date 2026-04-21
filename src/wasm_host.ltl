@@ -1,0 +1,91 @@
+// playground/src/wasm_host.ltl — WASM host shim for the in-browser REPL.
+//
+// The playground compiles user code → Lateralus bytecode → WASM module
+// in-browser via the `lateralus-compiler` crate built with
+// `--target wasm32-unknown-unknown`. This file is the thin host layer
+// that the generated WASM imports: `print`, `read_stdin`, `time_ns`,
+// `panic_hook`, and a capability-scoped `fs_read` that only resolves
+// against an in-memory VFS populated from the URL fragment.
+//
+// Security: there is no direct JS eval, no network egress, no DOM
+// access from guest code. Only the four imports above are exposed.
+// Each execution runs in a fresh instance with a 128 MiB memory cap
+// and a 5-second wall-clock kill switch enforced by the host JS.
+
+use wasm::bindgen
+use sync::mutex::Mutex
+use collections::btreemap::BTreeMap
+
+pub struct GuestIO {
+    pub stdout: Mutex<Vec<u8>>,
+    pub stdin_cursor: Mutex<usize>,
+    pub stdin_buf: Vec<u8>,
+    pub vfs: BTreeMap<String, Vec<u8>>,
+    pub deadline_ns: u64,
+    pub started_ns: u64,
+}
+
+impl GuestIO {
+    pub fn new(stdin: Vec<u8>, vfs: BTreeMap<String, Vec<u8>>, budget_ms: u64) -> Self {
+        let now = wasm::perf_now_ns()
+        Self {
+            stdout: Mutex::new(Vec::with_capacity(64 * 1024)),
+            stdin_cursor: Mutex::new(0),
+            stdin_buf: stdin, vfs,
+            deadline_ns: now + budget_ms * 1_000_000,
+            started_ns: now,
+        }
+    }
+
+    pub fn tick(&self) -> Result<(), &'static str> {
+        if wasm::perf_now_ns() > self.deadline_ns { Err("budget exhausted") } else { Ok(()) }
+    }
+}
+
+#[bindgen]
+pub fn host_print(io: &GuestIO, ptr: u32, len: u32) -> Result<(), &'static str> {
+    io.tick()?
+    let slice = wasm::memory_slice(ptr, len)
+    let mut out = io.stdout.lock()
+    if out.len() + slice.len() > 2 * 1024 * 1024 { return Err("stdout overflow (2 MiB)") }
+    out.extend_from_slice(slice)
+    Ok(())
+}
+
+#[bindgen]
+pub fn host_read_stdin(io: &GuestIO, ptr: u32, cap: u32) -> Result<u32, &'static str> {
+    io.tick()?
+    let mut cur = io.stdin_cursor.lock()
+    let remaining = io.stdin_buf.len() - *cur
+    let n = remaining.min(cap as usize)
+    wasm::memory_write(ptr, &io.stdin_buf[*cur..*cur + n])
+    *cur += n
+    Ok(n as u32)
+}
+
+#[bindgen]
+pub fn host_time_ns(io: &GuestIO) -> u64 {
+    // Offset from start so guests cannot fingerprint the real host clock.
+    wasm::perf_now_ns().saturating_sub(io.started_ns)
+}
+
+#[bindgen]
+pub fn host_fs_read(io: &GuestIO, path_ptr: u32, path_len: u32,
+                   out_ptr: u32, out_cap: u32) -> Result<u32, &'static str> {
+    io.tick()?
+    let path = std::str::from_utf8(wasm::memory_slice(path_ptr, path_len))
+        .map_err(|_| "path not utf8")?
+    let Some(blob) = io.vfs.get(path) else { return Err("no such file") }
+    let n = blob.len().min(out_cap as usize)
+    wasm::memory_write(out_ptr, &blob[..n])
+    Ok(n as u32)
+}
+
+#[bindgen]
+pub fn host_panic(io: &GuestIO, ptr: u32, len: u32) {
+    let msg = wasm::memory_slice(ptr, len)
+    let mut out = io.stdout.lock()
+    out.extend_from_slice(b"\n--- panic ---\n")
+    out.extend_from_slice(msg)
+    out.push(b'\n')
+}
