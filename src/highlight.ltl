@@ -1,0 +1,118 @@
+// playground/src/highlight.ltl — Streaming syntax highlighter for .ltl.
+//
+// Powers the <pre class="ltl"> blocks on play.lateralus.dev and the
+// marketing site. No dependency on the full parser: a pure
+// table-driven scanner that emits (class, start, end) spans for the
+// edit pane's virtualized renderer. The editor feeds it on every
+// keystroke with a region around the cursor.
+
+pub enum Tok { Keyword, Type, Ident, Num, Str, Char, Comment, Op, Punct, Whitespace, Error }
+
+pub struct Span { pub cls: Tok, pub start: u32, pub end: u32 }
+
+const KEYWORDS: &[&str] = &[
+    "fn", "pub", "let", "mut", "const", "if", "else", "match", "for", "while",
+    "loop", "break", "continue", "return", "use", "mod", "struct", "enum",
+    "impl", "trait", "where", "as", "in", "self", "Self", "true", "false",
+    "async", "await", "move", "ref", "static", "unsafe", "dyn",
+]
+
+const PRIMITIVE_TYPES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "u128", "usize",
+    "i8", "i16", "i32", "i64", "i128", "isize",
+    "f32", "f64", "bool", "char", "str", "String", "Vec", "Option", "Result",
+]
+
+pub fn scan(src: &str) -> Vec<Span> {
+    let bytes = src.as_bytes()
+    let mut out = Vec::with_capacity(src.len() / 6)
+    let mut i = 0usize
+    while i < bytes.len() {
+        let start = i
+        let b = bytes[i]
+        let tok = match b {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1 }
+                Tok::Whitespace
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' { i += 1 }
+                Tok::Comment
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') { i += 1 }
+                i = (i + 2).min(bytes.len())
+                Tok::Comment
+            }
+            b'"' => {
+                i += 1
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 2 } else { i += 1 }
+                }
+                i = (i + 1).min(bytes.len())
+                Tok::Str
+            }
+            b'\'' => {
+                // Char literal OR lifetime — disambiguate: lifetime if next is ident-ish.
+                if bytes.get(i + 1).map_or(false, |c| c.is_ascii_alphabetic() || *c == b'_')
+                   && bytes.get(i + 2).map_or(true, |c| !c.is_ascii_alphanumeric() && *c != b'_') {
+                    i += 1
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1 }
+                    Tok::Type // render lifetimes like types
+                } else {
+                    i += 1
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 2 } else { i += 1 }
+                    }
+                    i = (i + 1).min(bytes.len())
+                    Tok::Char
+                }
+            }
+            b'0'..=b'9' => {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') { i += 1 }
+                Tok::Num
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1 }
+                let word = &src[start..i]
+                if KEYWORDS.contains(&word) { Tok::Keyword }
+                else if PRIMITIVE_TYPES.contains(&word) { Tok::Type }
+                else if word.chars().next().map_or(false, |c| c.is_ascii_uppercase()) { Tok::Type }
+                else { Tok::Ident }
+            }
+            b'+'|b'-'|b'*'|b'/'|b'%'|b'='|b'<'|b'>'|b'!'|b'&'|b'|'|b'^'|b'~'|b'?' => {
+                while i < bytes.len() && matches!(bytes[i],
+                    b'+'|b'-'|b'*'|b'/'|b'%'|b'='|b'<'|b'>'|b'!'|b'&'|b'|'|b'^'|b'~'|b'?') { i += 1 }
+                Tok::Op
+            }
+            b'('|b')'|b'{'|b'}'|b'['|b']'|b','|b';'|b':'|b'.'|b'@'|b'#'|b'$' => { i += 1; Tok::Punct }
+            _ => { i += 1; Tok::Error }
+        }
+        out.push(Span { cls: tok, start: start as u32, end: i as u32 })
+    }
+    out
+}
+
+pub fn to_html(src: &str) -> String {
+    let spans = scan(src)
+    let mut html = String::with_capacity(src.len() * 2)
+    html.push_str("<pre class=\"ltl\">")
+    for s in spans {
+        let cls = match s.cls {
+            Tok::Keyword => "k", Tok::Type => "t", Tok::Ident => "i",
+            Tok::Num => "n", Tok::Str => "s", Tok::Char => "c",
+            Tok::Comment => "m", Tok::Op => "o", Tok::Punct => "p",
+            Tok::Whitespace => "", Tok::Error => "e",
+        }
+        let text = escape_html(&src[s.start as usize..s.end as usize])
+        if cls.is_empty() { html.push_str(&text) }
+        else { html.push_str(&format!("<span class=\"{}\">{}</span>", cls, text)) }
+    }
+    html.push_str("</pre>")
+    html
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
