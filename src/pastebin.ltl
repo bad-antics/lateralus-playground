@@ -1,0 +1,99 @@
+// playground/src/pastebin.ltl — Pastebin backend for snippets > 2 KB.
+//
+// When a share URL would exceed the browser cap (~2 KB after deflate),
+// the frontend POSTs the raw payload here and gets back an 8-char
+// slug. Storage is content-addressed (sha256 → base32 → first 8 chars)
+// so identical pastes dedupe for free. Backed by SQLite with a
+// 90-day TTL on last-accessed. No accounts, no tracking.
+
+use crypto::sha256
+use encoding::base32_crockford
+use db::sqlite::{Connection, Params}
+use time::{SystemTime, Duration}
+use http::{Request, Response, StatusCode}
+
+pub struct Pastebin {
+    conn: Connection,
+    max_bytes: usize,
+    ttl: Duration,
+}
+
+impl Pastebin {
+    pub fn open(path: &str) -> Result<Self, sqlite::Error> {
+        let conn = Connection::open(path)?
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS pastes (
+                slug       TEXT PRIMARY KEY,
+                payload    BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                touched_at INTEGER NOT NULL,
+                hits       INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_touched ON pastes(touched_at);
+        ")?
+        Ok(Self { conn, max_bytes: 1_048_576, ttl: Duration::from_days(90) })
+    }
+
+    pub fn put(&self, payload: &[u8]) -> Result<String, Error> {
+        if payload.len() > self.max_bytes { return Err(Error::TooLarge) }
+        let digest = sha256::hash(payload)
+        let slug   = base32_crockford::encode(&digest[..5])[..8].to_string()
+        let now    = SystemTime::now().unix_secs() as i64
+
+        self.conn.execute(
+            "INSERT INTO pastes(slug,payload,created_at,touched_at) VALUES(?,?,?,?) \
+             ON CONFLICT(slug) DO UPDATE SET touched_at = excluded.touched_at",
+            Params::from((&slug, payload, now, now)),
+        )?
+        Ok(slug)
+    }
+
+    pub fn get(&self, slug: &str) -> Result<Vec<u8>, Error> {
+        if slug.len() != 8 || !slug.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(Error::BadSlug)
+        }
+        let now = SystemTime::now().unix_secs() as i64
+        let row: Option<(Vec<u8>, i64)> = self.conn.query_row(
+            "SELECT payload, created_at FROM pastes WHERE slug = ?",
+            Params::from((slug,)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?
+        let (blob, created) = row.ok_or(Error::NotFound)?
+        if now - created > self.ttl.as_secs() as i64 { return Err(Error::Expired) }
+        self.conn.execute(
+            "UPDATE pastes SET touched_at=?, hits=hits+1 WHERE slug=?",
+            Params::from((now, slug)),
+        )?
+        Ok(blob)
+    }
+
+    pub fn gc(&self) -> Result<usize, Error> {
+        let cutoff = SystemTime::now().unix_secs() as i64 - self.ttl.as_secs() as i64
+        let n = self.conn.execute(
+            "DELETE FROM pastes WHERE touched_at < ?", Params::from((cutoff,)),
+        )?
+        Ok(n)
+    }
+}
+
+pub enum Error { TooLarge, BadSlug, NotFound, Expired, Db(sqlite::Error) }
+
+impl From<sqlite::Error> for Error { fn from(e: sqlite::Error) -> Self { Error::Db(e) } }
+
+pub fn serve(pb: &Pastebin, req: &Request) -> Response {
+    match (req.method(), req.path()) {
+        ("POST", "/paste") => match pb.put(req.body()) {
+            Ok(slug) => Response::new(StatusCode::OK).body(slug.into_bytes()),
+            Err(Error::TooLarge) => Response::new(StatusCode::PAYLOAD_TOO_LARGE),
+            Err(_)               => Response::new(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+        ("GET", p) if p.starts_with("/paste/") => match pb.get(&p[7..]) {
+            Ok(blob) => Response::new(StatusCode::OK).body(blob)
+                .header("Cache-Control", "public, max-age=3600, immutable"),
+            Err(Error::NotFound) | Err(Error::Expired) => Response::new(StatusCode::NOT_FOUND),
+            Err(Error::BadSlug) => Response::new(StatusCode::BAD_REQUEST),
+            Err(_)              => Response::new(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+        _ => Response::new(StatusCode::NOT_FOUND),
+    }
+}
