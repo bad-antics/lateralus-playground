@@ -1,0 +1,87 @@
+// playground/src/sandbox.ltl — Worker-backed execution sandbox.
+//
+// Browser-side coordinator. Spawns a dedicated Web Worker, posts the
+// compiled WASM module + host shims (from wasm_host.ltl), and
+// streams stdout back via postMessage. The main thread remains
+// responsive throughout; a hard kill re-creates the worker if guest
+// code spins past its budget.
+
+use concurrent::worker::{Worker, Message}
+use time::{Instant, Duration}
+use encoding::json
+
+pub struct Sandbox {
+    worker: Worker,
+    busy: bool,
+}
+
+pub struct RunResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub wall_ms: u64,
+    pub killed: bool,
+}
+
+pub struct RunRequest {
+    pub wasm_module: Vec<u8>,
+    pub stdin: String,
+    pub budget_ms: u64,
+    pub memory_mib: u32,
+}
+
+impl Sandbox {
+    pub fn new() -> Self {
+        Self { worker: Worker::spawn("/playground-worker.js"), busy: false }
+    }
+
+    pub async fn run(&mut self, req: RunRequest) -> RunResult {
+        let start = Instant::now()
+        self.busy = true
+
+        // Fire the request.
+        self.worker.post(Message::Binary(json::to_vec(&json::object!{
+            "wasm":    base64_encode(&req.wasm_module),
+            "stdin":   &req.stdin,
+            "budget":  req.budget_ms,
+            "memory":  req.memory_mib,
+        })))
+
+        let mut stdout = String::new()
+        let mut stderr = String::new()
+        let deadline = start + Duration::from_millis(req.budget_ms + 500)
+
+        loop {
+            match self.worker.recv_until(deadline).await {
+                Some(Message::Text(t)) if t.starts_with("out:") => stdout.push_str(&t[4..]),
+                Some(Message::Text(t)) if t.starts_with("err:") => stderr.push_str(&t[4..]),
+                Some(Message::Text(t)) if t.starts_with("exit:") => {
+                    let code = t[5..].parse().unwrap_or(-1)
+                    self.busy = false
+                    return RunResult {
+                        stdout, stderr, exit_code: code,
+                        wall_ms: start.elapsed().as_millis() as u64,
+                        killed: false,
+                    }
+                }
+                None => {
+                    self.worker.terminate()
+                    self.worker = Worker::spawn("/playground-worker.js")
+                    self.busy = false
+                    return RunResult {
+                        stdout, stderr, exit_code: 137,
+                        wall_ms: req.budget_ms, killed: true,
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    pub fn is_busy(&self) -> bool { self.busy }
+}
+
+fn base64_encode(b: &[u8]) -> String {
+    let s: String = b.iter().map(|&x| x as char).collect()
+    js::btoa(&s)
+}
