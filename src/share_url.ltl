@@ -1,0 +1,58 @@
+// playground/src/share_url.ltl — Shareable "Try it" URL encoder.
+//
+// A shared playground session fits in the URL fragment (after #) so
+// nothing hits a server. Layout:
+//   v1:<base64url(deflate_raw(MessagePack({ src, stdin, flags })))>
+// Raw-deflate (RFC 1951) is used because browsers expose it via
+// `CompressionStream('deflate-raw')`. Typical 1-screen program
+// compresses to ~200-400 URL bytes — well under the 2 KB practical
+// URL cap on all major browsers.
+
+use compress::deflate_raw
+use encoding::{base64_url, msgpack}
+
+pub struct Session {
+    pub src: String,
+    pub stdin: String,
+    pub flags: Vec<String>,   // --release, --no-std, etc.
+    pub entry: String,        // "main" by default
+}
+
+pub fn encode(s: &Session) -> String {
+    let pack = msgpack::encode(&msgpack::Value::Map(vec![
+        (msgpack::Value::Str("src".into()),   msgpack::Value::Str(s.src.clone())),
+        (msgpack::Value::Str("stdin".into()), msgpack::Value::Str(s.stdin.clone())),
+        (msgpack::Value::Str("flags".into()), msgpack::Value::Array(
+            s.flags.iter().map(|f| msgpack::Value::Str(f.clone())).collect()
+        )),
+        (msgpack::Value::Str("entry".into()), msgpack::Value::Str(s.entry.clone())),
+    ]))
+    let mut z = Vec::with_capacity(pack.len())
+    deflate_raw::encode(&pack, &mut z, deflate_raw::Level::Default)
+    format!("v1:{}", base64_url::encode(&z))
+}
+
+pub fn decode(fragment: &str) -> Result<Session, &'static str> {
+    let tail = fragment.strip_prefix("v1:").ok_or("not a v1 share url")?
+    let z = base64_url::decode(tail).map_err(|_| "base64url error")?
+    if z.len() > 16 * 1024 { return Err("share payload > 16 KiB") }
+    let mut raw = Vec::with_capacity(z.len() * 4)
+    deflate_raw::decode(&z, &mut raw, /*max_out=*/ 2 * 1024 * 1024)?
+    let (root, _) = msgpack::decode(&raw).map_err(|_| "msgpack parse error")?
+    let m = root.into_map().ok_or("root not a map")?
+    let take = |k: &str| -> Option<msgpack::Value> {
+        m.iter().find(|(kk, _)| kk.as_str() == Some(k)).map(|(_, v)| v.clone())
+    }
+    Ok(Session {
+        src:   take("src").and_then(|v| v.into_string()).ok_or("no src")?,
+        stdin: take("stdin").and_then(|v| v.into_string()).unwrap_or_default(),
+        flags: take("flags").and_then(|v| v.into_array()).unwrap_or_default()
+                .into_iter().filter_map(|v| v.into_string()).collect(),
+        entry: take("entry").and_then(|v| v.into_string()).unwrap_or_else(|| "main".into()),
+    })
+}
+
+pub fn short_link(s: &Session, base: &str) -> String {
+    // base = "https://play.lateralus.dev/#"
+    format!("{}{}", base, encode(s))
+}
